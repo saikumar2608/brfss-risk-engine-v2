@@ -1,246 +1,297 @@
 # utils/helper.py
-# Shared helpers for BRFSS Risk Engine v2
+# ------------------------------------------------------------
+# Small, human-readable helper layer used by Risk Engine v2.
+# ------------------------------------------------------------
 
 from __future__ import annotations
 
 import math
 from contextlib import contextmanager
-from typing import Dict, Any, Iterable
+from functools import lru_cache
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
 import shap
 import matplotlib.pyplot as plt
 import streamlit as st
-from sklearn.calibration import CalibratedClassifierCV
 
-# ---------------------------
+
+# ============================================================
 # UI helpers
-# ---------------------------
+# ============================================================
+
 @contextmanager
 def card():
-    """Simple card-like container."""
+    """Simple visual grouping—kept minimal on purpose."""
     with st.container(border=True):
         yield
 
 def muted(text: str):
     st.caption(text)
 
-def _is_label_to_code(mapping: Dict[Any, Any]) -> bool:
-    """Detect if mapping is {label->code} vs {code->label}."""
-    # Heuristic: label strings on keys implies label->code
-    return all(isinstance(k, str) for k in mapping.keys())
+def _reverse_lookup(mapping: Dict[int, str], label: str) -> int:
+    for k, v in mapping.items():
+        if v == label:
+            return int(k)
+    raise KeyError(f"Label {label!r} not found")
 
-def coded_selectbox(label: str, mapping: Dict[Any, Any], key: str, index: int | None = None):
+def coded_radio(
+    label: str,
+    mapping: Dict[int, str] | Dict[str, int],
+    key: Optional[str] = None,
+    horizontal: bool = False,
+):
     """
-    Show a selectbox with human labels and return the underlying code.
-    Accepts either {code->label} or {label->code}.
+    Radio that *shows friendly labels* but returns the code.
+    Accepts either {code:int -> label:str} OR {label:str -> code:int}.
     """
-    if _is_label_to_code(mapping):
-        labels = list(mapping.keys())
-        codes  = list(mapping.values())
-    else:
-        codes  = list(mapping.keys())
+    if mapping and isinstance(next(iter(mapping.keys())), int):
+        # {code -> label}
         labels = list(mapping.values())
-
-    default_index = 0 if index is None else index
-    choice = st.selectbox(label, labels, index=default_index, key=key)
-    if _is_label_to_code(mapping):
-        return mapping[choice]
-    # find code for chosen label
-    return codes[labels.index(choice)]
-
-def coded_radio(label: str, mapping: Dict[Any, Any], key: str, horizontal: bool = False):
-    """
-    Show a radio with human labels and return the underlying code.
-    Accepts either {code->label} or {label->code}.
-    """
-    if _is_label_to_code(mapping):
-        labels = list(mapping.keys())
-        codes  = list(mapping.values())
+        default = labels[0]
+        choice = st.radio(label, labels, key=key, horizontal=horizontal, index=labels.index(default))
+        return _reverse_lookup(mapping, choice)
     else:
-        codes  = list(mapping.keys())
-        labels = list(mapping.values())
+        # {label -> code}
+        labels = list(mapping.keys())
+        choice = st.radio(label, labels, key=key, horizontal=horizontal)
+        return int(mapping[choice])
 
-    choice = st.radio(label, labels, key=key, horizontal=horizontal)
-    if _is_label_to_code(mapping):
-        return mapping[choice]
-    return codes[labels.index(choice)]
+def coded_selectbox(label: str, mapping: Dict[int, str], key: Optional[str] = None):
+    """Selectbox that shows labels and returns the code."""
+    labels = list(mapping.values())
+    choice = st.selectbox(label, labels, key=key)
+    return _reverse_lookup(mapping, choice)
 
-def clinician_paragraph() -> str:
-    return (
-        "This tool estimates **probabilities** using models trained on BRFSS-like survey data. "
-        "It’s built for **screening and awareness**, not diagnosis or treatment. "
-        "We show local SHAP bars so you can see which inputs push the score **up** or **down** "
-        "for this person. Outputs should be interpreted alongside vitals, labs, and history."
-    )
 
-# ---------------------------
-# BMI helpers
-# ---------------------------
+# ============================================================
+# BMI utilities
+# ============================================================
+
 def calc_bmi(weight: float, weight_unit: str, height_cm: float) -> float:
-    """Compute BMI from weight (kg/lbs) and height in cm."""
+    """BMI = kg / m^2. Supports kg/lbs in, converts to cm→m internally."""
     kg = weight if weight_unit == "kg" else weight * 0.45359237
-    m  = height_cm / 100.0
-    return kg / (m * m) if m > 0 else float("nan")
+    m = height_cm / 100.0
+    if m <= 0:
+        return float("nan")
+    return float(round(kg / (m * m), 2))
 
 def interpret_bmi_standard(bmi: float) -> str:
     if math.isnan(bmi):
-        return "Unknown"
-    if bmi < 18.5: return "Underweight"
-    if bmi < 25.0: return "Normal"
-    if bmi < 30.0: return "Overweight"
-    return "Obese"
+        return "—"
+    if bmi < 18.5:
+        return "Underweight"
+    if bmi < 25:
+        return "Normal"
+    if bmi < 30:
+        return "Overweight"
+    return "Obesity"
 
 def interpret_bmi_asian(bmi: float) -> str:
     if math.isnan(bmi):
-        return "Unknown"
-    if bmi < 18.5: return "Underweight"
-    if bmi < 23.0: return "Normal"
-    if bmi < 27.5: return "Overweight"
-    return "Obese"
+        return "—"
+    if bmi < 18.5:
+        return "Underweight"
+    if bmi < 23:
+        return "Normal"
+    if bmi < 27.5:
+        return "At risk / Overweight"
+    return "Obesity"
 
 def plot_bmi_gauge(bmi: float):
-    """Tiny horizontal gauge for BMI."""
-    plt.figure(figsize=(6, 0.6))
-    plt.axvspan(0,   18.5, alpha=0.2)
-    plt.axvspan(18.5, 25,  alpha=0.2)
-    plt.axvspan(25,  30,  alpha=0.2)
-    plt.axvspan(30,  45,  alpha=0.2)
-    plt.axvline(bmi, linewidth=3)
-    plt.xlim(10, 45)
-    plt.yticks([])
-    plt.xlabel("BMI")
-    plt.tight_layout()
-    st.pyplot(plt.gcf())
-    plt.close()
+    """Tiny horizontal gauge—fast and dependency-free."""
+    fig, ax = plt.subplots(figsize=(6, 1.0))
+    ax.set_xlim(10, 50)
+    ax.set_ylim(0, 1)
+    ax.barh(0.5, 8.5, left=10, alpha=0.25)   # <18.5
+    ax.barh(0.5, 6.5, left=18.5, alpha=0.25) # 18.5–25
+    ax.barh(0.5, 5,   left=25, alpha=0.25)   # 25–30
+    ax.barh(0.5, 20,  left=30, alpha=0.25)   # 30–50
+    ax.axvline(bmi, linewidth=2)
+    ax.set_yticks([]); ax.set_xlabel("BMI")
+    ax.text(bmi, 0.8, f"{bmi:.1f}", ha="center", va="bottom")
+    st.pyplot(fig)
+    plt.close(fig)
 
-def obesity_status_from_bmi(bmi: float, race_group_code: int) -> Dict[str, Any]:
-    """Definition flag for obesity with Asian-specific cutoff."""
-    asian_codes = {3}  # our mapping uses 3 for Asian
-    cutoff = 25.0 if race_group_code in asian_codes else 30.0
-    is_obese = (bmi >= cutoff)
-    return {
-        "is_obese": is_obese,
-        "cutoff": cutoff,
-        "reason": f"Obesity definition uses BMI ≥ {cutoff:.1f} (Asian-specific threshold if applicable)."
-    }
+def obesity_status_from_bmi(bmi: float, race_group_code: int) -> dict:
+    """
+    'Asian' cutoff 25.0 (race code 3 in our map), others 30.0.
+    Returns dict: {is_obese, cutoff, reason}
+    """
+    cutoff = 25.0 if int(race_group_code) == 3 else 30.0
+    is_obese = float(bmi) >= cutoff
+    reason = f"Race-aware cutoff used: {'Asian' if int(race_group_code)==3 else 'Standard'} ({cutoff:.1f})."
+    return {"is_obese": is_obese, "cutoff": cutoff, "reason": reason}
 
-# ---------------------------
-# Age mapping
-# ---------------------------
+
+# ============================================================
+# Age mapping (BRFSS style)
+# ============================================================
+
 def map_age_to_group_13(age: int) -> int:
     """
-    Map age in years to BRFSS _AGEG5YR style 13-bin code:
-    1=18-24, 2=25-29, ..., 13=80+ (we compress some bands reasonably).
+    Maps age in years to BRFSS 13-level bin (1..13).
+    (18–24)->1, (25–29)->2, ..., (80+)->13
     """
-    bands = [
-        (18, 24), (25, 29), (30, 34), (35, 39), (40, 44),
-        (45, 49), (50, 54), (55, 59), (60, 64), (65, 69),
-        (70, 74), (75, 79), (80, 120),
-    ]
-    for i, (lo, hi) in enumerate(bands, start=1):
-        if lo <= age <= hi:
+    a = max(18, min(int(age), 120))
+    edges = [24, 29, 34, 39, 44, 49, 54, 59, 64, 69, 74, 79]
+    for i, hi in enumerate(edges, start=1):
+        if a <= hi:
             return i
     return 13
 
-def age6_from_age13(age13: int) -> int:
-    """
-    Collapse 13-bin code to 6 broad groups used in some dashboards:
-    1:18-24, 2:25-34, 3:35-44, 4:45-54, 5:55-64, 6:65+
-    """
-    if age13 <= 1: return 1
-    if age13 <= 3: return 2
-    if age13 <= 5: return 3
-    if age13 <= 7: return 4
-    if age13 <= 9: return 5
-    return 6
+def age6_from_age13(code13: int) -> int:
+    """Rough mapping from 13-level to 6-level groups (1..6)."""
+    c = int(code13)
+    if c <= 2:  # 18–34
+        return 1
+    if c <= 4:  # 35–44
+        return 2
+    if c <= 6:  # 45–54
+        return 3
+    if c <= 8:  # 55–64
+        return 4
+    if c <= 10: # 65–74
+        return 5
+    return 6     # 75+
 
-# ---------------------------
-# Model utils + SHAP
-# ---------------------------
+
+# ============================================================
+# Model prep / alignment
+# ============================================================
+
 def preprocess_input(df: pd.DataFrame) -> pd.DataFrame:
-    """Light touch: ensure numeric types where expected; fill nothing."""
-    return df.copy()
+    """
+    Light sanitation: cast numerics, coerce NaNs to 0 for model inputs.
+    Keep column order as provided; alignment happens later.
+    """
+    out = df.copy()
+    for c in out.columns:
+        if c in ("bmi", "estimated_diabetes_duration"):
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(float)
+        else:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+    return out
 
-def _model_feature_names(model) -> list[str] | None:
-    """Try to recover feature names from the model."""
+def _expected_feature_list(model, fallback: Optional[List[str]]) -> Optional[List[str]]:
+    if fallback:
+        return list(fallback)
+    # sklearn 1.3+ stores names here
     if hasattr(model, "feature_names_in_"):
         return list(model.feature_names_in_)
-    # XGBClassifier sometimes exposes booster with feature names
+    # otherwise try unwrapped
+    names = _model_feature_names(model)
+    return list(names) if names else None
+
+def get_aligned_input(
+    model,
+    X: pd.DataFrame,
+    features: Optional[Iterable[str]] = None,
+    model_name: str = "",
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Reindex to model's expected feature order. Unknowns dropped, missing filled with 0.
+    """
+    want = _expected_feature_list(model, list(features) if features else None)
+    if want is None:
+        # Fall back to whatever user provided (single-row case)
+        return X.copy()
+    aligned = X.reindex(columns=want).fillna(0)
+    return aligned
+
+def clamp_training_domains(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Very light sanity clamps so single out-of-range inputs don't explode SHAP.
+    """
+    out = X.copy()
+    if "bmi" in out:
+        out["bmi"] = out["bmi"].clip(10, 60)
+    if "general_health" in out:
+        out["general_health"] = out["general_health"].clip(1, 5)
+    if "age_group_code" in out:
+        out["age_group_code"] = out["age_group_code"].clip(1, 13)
+    if "sex" in out:
+        out["sex"] = out["sex"].clip(1, 2)
+    if "recent_checkup" in out:
+        out["recent_checkup"] = out["recent_checkup"].clip(0, 1)
+    return out
+
+
+# ============================================================
+# SHAP utilities (with calibrated model unwrap)
+# ============================================================
+
+def _unwrap_estimator(model):
+    """
+    Return the real estimator inside wrappers like CalibratedClassifierCV
+    across scikit-learn versions.
+    """
+    # Fitted CalibratedClassifierCV exposes a list of _CalibratedClassifier
+    if hasattr(model, "calibrated_classifiers_") and model.calibrated_classifiers_:
+        inner = model.calibrated_classifiers_[0]
+        return getattr(inner, "estimator", getattr(inner, "base_estimator", model))
+
+    # (pre-fit) attribute names vary by version
+    if hasattr(model, "estimator"):
+        return model.estimator
+    if hasattr(model, "base_estimator"):
+        return model.base_estimator
+
+    return model
+
+def _model_feature_names(model) -> Optional[List[str]]:
+    base = _unwrap_estimator(model)
+    if hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+    if hasattr(base, "feature_names_in_"):
+        return list(base.feature_names_in_)
+    # try xgboost booster
     try:
-        booster = model.get_booster()
-        if booster and booster.feature_names:
+        booster = getattr(base, "get_booster", lambda: None)()
+        if booster is not None and getattr(booster, "feature_names", None):
             return list(booster.feature_names)
     except Exception:
         pass
     return None
 
-def get_aligned_input(model, X: pd.DataFrame, want: Iterable[str] | None,
-                      model_name: str = "", verbose: bool = False) -> pd.DataFrame:
-    """
-    Align input columns to what the model expects.
-    - If 'want' is None, we try model.feature_names_in_ (or booster names).
-    - Extra columns are dropped; missing columns are created as zeros.
-    """
-    X = X.copy()
-    if want is None:
-        want = _model_feature_names(model)
-    if want is None:
-        # Fall back: assume incoming X is already correct
-        return X
+@lru_cache(maxsize=12)
+def _cached_tree_explainer_key(key: str):
+    # dummy cache key function; actual explainer cached by Streamlit below
+    return key
 
-    want = list(want)
-    X = X.reindex(columns=want, fill_value=0)
-    return X
-
-def clamp_training_domains(X: pd.DataFrame) -> pd.DataFrame:
-    """Placeholder for any domain clamping; currently a no-op."""
-    return X
-
-def _unwrap_for_shap(model):
-    """
-    If the model is CalibratedClassifierCV, unwrap to the base estimator so SHAP
-    explains the *booster*, not the calibrator.
-    """
-    if isinstance(model, CalibratedClassifierCV):
-        # cv='prefit'
-        if hasattr(model, "base_estimator") and model.base_estimator is not None:
-            return model.base_estimator
-        # cv=kfold (take first calibrated fold)
-        if hasattr(model, "calibrated_classifiers_") and model.calibrated_classifiers_:
-            return model.calibrated_classifiers_[0].base_estimator
-    return model
-
-_EXPLAINERS: Dict[str, shap.Explainer] = {}
-
+@st.cache_resource(show_spinner=False)
 def get_shap_explainer(key: str, model):
     """
-    Cache a SHAP explainer on the *unwrapped* model.
-    We use model_output='raw' so values are on the log-odds scale for class=1.
+    Cached SHAP explainer factory.
+    - Unwraps calibrated models
+    - Uses model_output='raw' so positive values push P(class=1) up
     """
-    base = _unwrap_for_shap(model)
-    if key not in _EXPLAINERS:
-        _EXPLAINERS[key] = shap.Explainer(base, model_output="raw")
-    return _EXPLAINERS[key]
+    _ = _cached_tree_explainer_key(key)  # make key part of cache
+    base = _unwrap_estimator(model)
+    try:
+        return shap.TreeExplainer(base, model_output="raw")
+    except Exception:
+        return shap.Explainer(base)
 
-def _shap_values_array(shap_out) -> np.ndarray:
+def _shap_values_array(explanation) -> np.ndarray:
     """
-    Normalize SHAP output to a (n_features,) array for the positive class.
+    Returns 1D SHAP values for POSITIVE class (index 1 if present).
     """
-    vals = shap_out.values
-    if isinstance(vals, list):   # multiclass: choose positive class
-        vals = vals[-1]
-    # vals shape is (1, n_features) for single-row explanations
-    return np.array(vals[0])
+    vals = getattr(explanation, "values", None)
+    if vals is None:
+        return np.zeros(0)
+    vals = np.array(vals)
+    # (n, f) or (n, 2, f)
+    if vals.ndim == 3 and vals.shape[1] == 2:
+        vals = vals[:, 1, :]
+    return vals[0]
 
-# ---------------------------
-# SHAP plotting (per person)
-# ---------------------------
-def plot_shap_bar_tidy(model, X_df: pd.DataFrame, title: str, top: int = 10, ensure: list[str] | None = None):
+def plot_shap_bar_tidy(model, X_df: pd.DataFrame, title: str, top: int = 10, ensure: Optional[List[str]] = None):
     """
-    Horizontal bar chart of per-person SHAP values (class=1, log-odds).
-    Right=pushes risk up; Left=pushes risk down.
+    Per-person tidy SHAP bar (class=1). Ensures selected features are shown even if
+    not in the top-k by absolute impact.
     """
     key = f"{model.__class__.__name__}_{title.lower().replace(' ', '_')}"
     explainer = get_shap_explainer(key, model)
@@ -260,13 +311,28 @@ def plot_shap_bar_tidy(model, X_df: pd.DataFrame, title: str, top: int = 10, ens
         if feat in df["feature"].values and feat not in top_df["feature"].values:
             top_df = pd.concat([top_df, df[df["feature"] == feat]]).drop_duplicates("feature", keep="first")
 
-    # Plot tidy horizontal bars
-    plt.figure(figsize=(8, 5))
     order = list(top_df.index)[::-1]
-    plt.barh(range(len(order)), top_df.loc[order, "impact"])
-    plt.yticks(range(len(order)), top_df.loc[order, "feature"])
-    plt.axvline(0, linewidth=1)
-    plt.title(f"Feature Impact - {title}")
-    plt.tight_layout()
-    st.pyplot(plt.gcf())
-    plt.close()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.barh(range(len(order)), top_df.loc[order, "impact"])
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels(top_df.loc[order, "feature"])
+    ax.axvline(0, linewidth=1)
+    ax.set_title(f"Feature Impact - {title}")
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# ============================================================
+# Clinician paragraph
+# ============================================================
+
+def clinician_paragraph() -> str:
+    return (
+        "This tool estimates **probability of condition** using gradient-boosted trees trained on "
+        "BRFSS-like survey data. Predictions are **screening-oriented** and calibrated to population "
+        "prevalence—not a diagnosis. Each score is paired with a per-person SHAP bar that shows which "
+        "inputs **pushed the probability up or down** (to the right increases risk, to the left reduces it). "
+        "Use alongside vitals, labs, and clinical judgment."
+    )
+
