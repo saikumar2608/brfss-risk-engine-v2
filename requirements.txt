@@ -1,9 +1,8 @@
-streamlit
-pandas
-numpy
-matplotlib
-pickle-mixin
-scikit-learn
-xgboost
-shap
-jobLib
+streamlit>=1.35
+numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.8.4
+joblib==1.4.2
+scikit-learn==1.6.1
+xgboost==3.0.0
+shap==0.46.0
