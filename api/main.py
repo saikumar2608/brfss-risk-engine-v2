@@ -1,14 +1,11 @@
 # api/main.py
 # BRFSS Risk Engine v2 — Streamlit pages
-# ------------------------------------------------------------
-# - Loads models from /models
-# - Collects inputs (BRFSS-like)
-# - Predicts per-condition risks
-# - Shows per-person SHAP bar charts (class=1, log-odds)
-# - Keeps UI labels human-friendly (no code numbers shown)
 
 import os
 import json
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -16,37 +13,37 @@ import streamlit as st
 from datetime import datetime
 
 from utils.helper import (
-    # UI helpers
+    # UI
     card, muted, coded_selectbox, coded_radio, clinician_paragraph,
-    # BMI helpers
+    # BMI
     calc_bmi, interpret_bmi_standard, interpret_bmi_asian,
     plot_bmi_gauge, obesity_status_from_bmi,
-    # Age helpers
+    # Age
     map_age_to_group_13, age6_from_age13,
-    # Model utilities & SHAP
+    # Model utils + SHAP
     preprocess_input, get_aligned_input, clamp_training_domains,
     get_shap_explainer, _shap_values_array, plot_shap_bar_tidy,
+    # GH flip only for HTN
+    gh_flip_series,
 )
+
+# quiet expected loader warnings
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+warnings.filterwarnings("ignore", message=".*serialized model.*xgboost.*")
 
 CURRENT_YEAR = datetime.now().year
 
-# ------------------------------------------------------------
-# Paths / model loaders
-# ------------------------------------------------------------
+# ---------- paths / loaders ----------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 @st.cache_resource
 def load_model(filename: str):
-    """Load a joblib model from /models (cached)."""
     return joblib.load(os.path.join(MODEL_DIR, filename))
 
-# ---- models ----
-# Force the monotonic, calibrated HTN model so signs are correct.
-# (If the calibrated file isn't present, it will fall back to the raw monotonic model.)
+# models
 DIABETES_MODEL_FILE = "xgb_model_diabetes_v2.pkl"
 HEART_MODEL_FILE    = "xgb_model_heart_v2.pkl"
-
 try:
     HTN_MODEL_FILE = "xgb_model_htn_v2_mono_cal.pkl"
     hypertension_model = load_model(HTN_MODEL_FILE)
@@ -57,51 +54,33 @@ except Exception:
 diabetes_model = load_model(DIABETES_MODEL_FILE)
 heart_model    = load_model(HEART_MODEL_FILE)
 
-# Obesity (propensity — NO BMI)
+# obesity propensity (no BMI)
 obesity_model_no_bmi     = load_model("xgb_model_obesity_no_bmi.pkl")
 obesity_model_no_bmi_cal = load_model("xgb_model_obesity_no_bmi_cal.pkl")
 with open(os.path.join(MODEL_DIR, "xgb_model_obesity_no_bmi_features.json"), "r") as f:
     FEATURES_OB_NO_BMI = json.load(f)
 
-# ------------------------------------------------------------
-# Display mappings (human labels in UI)
-# ------------------------------------------------------------
+# ---------- label maps ----------
 age_map = {1: "18-24", 2: "25-34", 3: "35-44", 4: "45-54", 5: "55-64", 6: "65+"}
-race_map = {
-    1: "White", 2: "Black/African American", 3: "Asian", 4: "Native American", 5: "Other", 9: "Unknown"
-}
-education_map = {
-    1: "Less than High School", 2: "High School Graduate", 3: "Some College",
-    4: "College Graduate", 5: "Postgraduate", 6: "Other", 9: "Unknown"
-}
-income_map = {
-    1: "<$15k", 2: "$15k-$25k", 3: "$25k-$35k", 4: "$35k-$50k",
-    5: "$50k-$75k", 6: "$75k-$100k", 7: "$100k-$150k", 8: "$150k+",
-    77: "Don't know", 99: "Refused"
-}
-marital_map = {
-    1: "Married", 2: "Divorced", 3: "Widowed", 4: "Separated", 5: "Never Married",
-    6: "Other", 9: "Unknown"
-}
+race_map = {1: "White", 2: "Black/African American", 3: "Asian", 4: "Native American", 5: "Other", 9: "Unknown"}
+education_map = {1: "Less than High School", 2: "High School Graduate", 3: "Some College", 4: "College Graduate", 5: "Postgraduate", 6: "Other", 9: "Unknown"}
+income_map = {1: "<$15k", 2: "$15k-$25k", 3: "$25k-$35k", 4: "$35k-$50k", 5: "$50k-$75k", 6: "$75k-$100k", 7: "$100k-$150k", 8: "$150k+", 77: "Don't know", 99: "Refused"}
+marital_map = {1: "Married", 2: "Divorced", 3: "Widowed", 4: "Separated", 5: "Never Married", 6: "Other", 9: "Unknown"}
 general_health_map = {1: "Excellent", 2: "Very Good", 3: "Good", 4: "Fair", 5: "Poor"}
 recent_checkup_map = {1: "Within 1 year", 2: "Within 2 years", 3: "Within 5 years", 4: "5+ years ago"}
 
-# Encodings used by the trained models (UI shows only labels)
 YES_NO_12 = {"Yes": 1, "No": 2}
 YN_01     = {"Yes": 1, "No": 0}
 YN_DK_RF  = {"Yes": 1, "No": 2, "Don't know": 7, "Refused": 9}
 
-# ------------------------------------------------------------
-# Feature lists (diabetes/heart use friendly names)
-# If hypertension was trained on raw feature names, we’ll read feature_names_in_ from the model.
-# ------------------------------------------------------------
+# ---------- feature lists (friendly names) ----------
 FEATURES = {
     "diabetes": [
         "age_group_code","sex","race_group","education_level","income_level","marital_status",
         "ever_smoked","phys_activity","any_alcohol","obesity","heart_disease","hypertension",
         "bmi","general_health","depression","cost_barrier","recent_checkup"
     ],
-    "hypertension": None,  # let alignment read from model.feature_names_in_
+    "hypertension": None,  # infer from model.feature_names_in_
     "heart": [
         "age_group_code","sex","race_group","education_level","income_level","marital_status",
         "ever_smoked","phys_activity","any_alcohol","diabetes","obesity","hypertension",
@@ -110,59 +89,53 @@ FEATURES = {
     ],
 }
 
-# ------------------------------------------------------------
-# Small helpers
-# ------------------------------------------------------------
+# ---------- helpers ----------
 def show_status_and_skip(label: str, already_has: bool, note: str = "") -> bool:
-    """Return True if condition is present and we should skip prediction."""
     if already_has:
         st.info(f"{label}: already present. Skipping risk prediction. {note}")
         st.metric(label, "Present")
         return True
     return False
 
-# ------------------------------------------------------------
-# Home
-# ------------------------------------------------------------
+# ---------- pages ----------
 def home_page():
     st.header("BRFSS Risk Engine v2")
 
     with card():
         st.markdown(
             """
-            **Screening-first risk estimates** for Diabetes, Hypertension, Heart Disease, and Obesity.  
-            Built on BRFSS-style inputs; explains each prediction with local SHAP.
+            Screening-first risk estimates for Diabetes, Hypertension, Heart Disease, and Obesity.  
+            Built on BRFSS-style inputs with per-person SHAP explanations.
             """
         )
         muted("Awareness tool — not for diagnosis or emergency use")
 
     with card():
         st.subheader("Get started")
-        c1, c2, c3 = st.columns([1, 1, 1])
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("Start with BMI"):
-                st.session_state["nav_page"] = "BMI Calculator"
+                st.session_state["__nav_redirect"] = "BMI Calculator"
                 st.rerun()
         with c2:
             if st.button("Go to Risk Prediction"):
-                st.session_state["nav_page"] = "Risk Prediction"
+                st.session_state["__nav_redirect"] = "Risk Prediction"
                 st.rerun()
         with c3:
             if st.button("Read About"):
-                st.session_state["nav_page"] = "About"
+                st.session_state["__nav_redirect"] = "About"
                 st.rerun()
-
         if "bmi_standard" in st.session_state:
             st.caption(f"BMI captured: {st.session_state['bmi_standard']:.2f} (ready for Risk Prediction)")
 
     with card():
-        st.subheader("What you’ll see")
+        st.subheader("What you'll see")
         st.markdown(
             """
-            - Inputs aligned with BRFSS codes (labels simplified for humans)  
+            - Inputs aligned with BRFSS codes  
             - Per-person SHAP explanations  
             - Race-aware BMI cutoff for obesity definition  
-            - Obesity propensity model that intentionally excludes BMI
+            - Obesity propensity excludes BMI
             """
         )
 
@@ -171,32 +144,29 @@ def home_page():
         st.markdown(clinician_paragraph())
     muted("Use alongside vitals, labs, and history. Calibrated to survey prevalence, not a clinic panel.")
 
-# ------------------------------------------------------------
-# BMI page
-# ------------------------------------------------------------
 def bmi_page():
     st.header("BMI Calculator")
     muted("Showing Standard and Asian cutoffs")
 
     with card():
-        col1, col2 = st.columns(2)
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             weight = st.number_input("Weight", min_value=30.0, max_value=200.0, step=0.1)
             unit_weight = st.selectbox("Weight Unit", ["kg", "lbs"])
-        with col2:
+        with c2:
             unit_height = st.selectbox("Height Unit", ["cm", "ft+in"])
             if unit_height == "cm":
                 height = st.number_input("Height (cm)", min_value=100.0, max_value=250.0, step=0.1)
             else:
                 feet = st.number_input("Height (ft)", min_value=3, max_value=8, step=1)
                 inches = st.number_input("Height (in)", min_value=0, max_value=11, step=1)
-                height = (feet * 30.48) + (inches * 2.54)
+                height = feet*30.48 + inches*2.54
 
         if st.button("Calculate BMI"):
             bmi = calc_bmi(weight, unit_weight, height)
             st.session_state["bmi_standard"] = round(bmi, 2)
             st.session_state["bmi_standard_category"] = interpret_bmi_standard(bmi)
-            st.session_state["bmi_asian_category"] = interpret_bmi_asian(bmi)
+            st.session_state["bmi_asian_category"]   = interpret_bmi_asian(bmi)
 
     if "bmi_standard" in st.session_state:
         with card():
@@ -205,38 +175,34 @@ def bmi_page():
             st.caption(f"Standard BMI: {st.session_state['bmi_standard_category']}")
             st.caption(f"Asian BMI: {st.session_state['bmi_asian_category']}")
             plot_bmi_gauge(bmi)
-            muted("Standard BMI is used for the 'definition' flag; propensity model excludes BMI.")
+            muted("Standard BMI is used for the definition flag; propensity excludes BMI.")
     return st.session_state.get("bmi_standard", None)
 
-# ------------------------------------------------------------
-# Risk page
-# ------------------------------------------------------------
 def risk_page(auto_bmi: float | None = None):
     st.header("Risk Prediction")
-    st.caption(f"HTN model file: {HTN_MODEL_FILE}")  # tiny readout so you know which file is active
+    st.caption(f"HTN model file: {HTN_MODEL_FILE}")
 
-    # ---- demographics ----
+    # demographics
     with card():
         st.subheader("Demographics")
         age = st.number_input("Age (years)", min_value=18, max_value=100, value=30)
         age_code13 = map_age_to_group_13(int(age))
         age6 = age6_from_age13(age_code13)
         st.info(f"BRFSS Age Group: {age_map[age6]}")
-
         sex = coded_radio("Sex", {"Male": 1, "Female": 2}, key="sex_radio", horizontal=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            race_group = coded_selectbox("Race Group", race_map, "race_group")
-            education_level = coded_selectbox("Education Level", education_map, "education_level")
-            income_level = coded_selectbox("Income Level", income_map, "income_level")
-        with col2:
-            marital_status = coded_selectbox("Marital Status", marital_map, "marital_status")
-            general_health = coded_selectbox("General Health", general_health_map, "general_health")
-            rc_ui = coded_selectbox("Recent Checkup", recent_checkup_map, "recent_checkup")
+        c1, c2 = st.columns(2)
+        with c1:
+            race_group       = coded_selectbox("Race Group",       race_map,       "race_group")
+            education_level  = coded_selectbox("Education Level",  education_map,  "education_level")
+            income_level     = coded_selectbox("Income Level",     income_map,     "income_level")
+        with c2:
+            marital_status   = coded_selectbox("Marital Status",   marital_map,    "marital_status")
+            general_health   = coded_selectbox("General Health",   general_health_map, "general_health")
+            rc_ui            = coded_selectbox("Recent Checkup",   recent_checkup_map, "recent_checkup")
             recent_checkup_01 = 1 if rc_ui == 1 else 0
 
-    # ---- lifestyle & health ----
+    # lifestyle + health
     with card():
         st.subheader("Lifestyle & Health")
         ever_smoked   = coded_radio("Ever Smoked?", YN_DK_RF, key="ever_smoked")
@@ -245,11 +211,11 @@ def risk_page(auto_bmi: float | None = None):
 
         diabetes          = coded_radio("Diabetes? (ever told by a professional)", YN_01, key="diabetes", horizontal=True)
         hypertension_code = coded_radio("Hypertension? (ever told high BP; not pregnancy-related)", YES_NO_12, key="hypertension", horizontal=True)
-        heart_disease     = coded_radio("Heart Disease? (heart attack/MI or coronary heart disease/angina)", YN_01, key="heart_disease", horizontal=True)
+        heart_disease     = coded_radio("Heart Disease? (MI or CHD/angina)", YN_01, key="heart_disease", horizontal=True)
         depression        = coded_radio("Depression?", YN_01, key="depression", horizontal=True)
-        cost_barrier      = coded_radio("Cost Barrier to Care in past 12 months?", YN_01, key="cost_barrier", horizontal=True)
+        cost_barrier      = coded_radio("Cost Barrier to Care (12 mo)?", YN_01, key="cost_barrier", horizontal=True)
 
-    # ---- BMI ----
+    # BMI
     with card():
         st.subheader("BMI (Optional)")
         if "bmi_standard" in st.session_state:
@@ -258,11 +224,11 @@ def risk_page(auto_bmi: float | None = None):
             st.caption(f"Standard: {st.session_state['bmi_standard_category']} | Asian: {st.session_state['bmi_asian_category']}")
             plot_bmi_gauge(bmi)
         else:
-            st.warning("No BMI calculated on the BMI page. Enter BMI manually or go to BMI page.")
+            st.warning("No BMI captured on BMI page. Enter manually or switch to BMI page.")
             bmi = float(st.number_input("Enter BMI (Standard)", min_value=10.0, max_value=60.0,
                                         value=auto_bmi if auto_bmi else 25.0))
 
-    # ---- build model row ----
+    # build single row (UI encodings)
     row = {
         "age_group_code": int(age_code13),
         "sex": int(sex),
@@ -274,11 +240,11 @@ def risk_page(auto_bmi: float | None = None):
         "phys_activity": int(phys_activity),
         "any_alcohol": int(any_alcohol),
         "diabetes": int(diabetes),
-        "obesity": 0,  # placeholder used by heart model only
+        "obesity": 0,  # placeholder for heart model
         "hypertension": int(hypertension_code),
         "heart_disease": int(heart_disease),
         "bmi": float(bmi),
-        "general_health": int(general_health),
+        "general_health": int(general_health),  # UI order 1=Excellent..5=Poor
         "depression": int(depression),
         "cost_barrier": int(cost_barrier),
         "recent_checkup": int(recent_checkup_01),
@@ -286,7 +252,6 @@ def risk_page(auto_bmi: float | None = None):
         "diabetes_duration_known": 0,
     }
 
-    # Years since diabetes diagnosis (simple direct capture)
     duration_years = int(st.slider("Years since diabetes diagnosis (0 if none/unknown)", 0, 30, 0))
     if diabetes == 1 and duration_years > 0:
         row["estimated_diabetes_duration"] = float(duration_years)
@@ -294,43 +259,63 @@ def risk_page(auto_bmi: float | None = None):
 
     X_raw = pd.DataFrame([row])
 
-    # ---- predict ----
     if st.button("Predict Risk"):
         try:
-            # clean + align (quietly)
-            X_prep  = preprocess_input(X_raw)
-            X_diab  = clamp_training_domains(get_aligned_input(diabetes_model,     X_prep, FEATURES["diabetes"],     model_name="diabetes",     verbose=False))
-            X_htn   = clamp_training_domains(get_aligned_input(hypertension_model, X_prep, FEATURES["hypertension"], model_name="hypertension", verbose=False))
-            X_heart = clamp_training_domains(get_aligned_input(heart_model,        X_prep, FEATURES["heart"],        model_name="heart",        verbose=False))
+            X_prep = preprocess_input(X_raw)
 
-            # Diabetes
+            # ----- DIABETES -----
+            X_diab = clamp_training_domains(
+                get_aligned_input(diabetes_model, X_prep, FEATURES["diabetes"], model_name="diabetes", verbose=False)
+            )
+
+            # ----- HYPERTENSION -----
+            X_htn_pre = X_prep.copy()
+            # CRITICAL: Apply the same preprocessing that was used during training
+            # flip GH only for HTN (UI 1=Excellent..5=Poor → Train 1=Poor..5=Excellent)
+            if "general_health" in X_htn_pre.columns:
+                X_htn_pre["general_health"] = gh_flip_series(X_htn_pre["general_health"])
+            # drop label field used during HTN training
+            X_htn_pre = X_htn_pre.drop(columns=["hypertension"], errors="ignore")
+            # engineered feature used in HTN training
+            if "bmi" in X_htn_pre.columns:
+                X_htn_pre["underweight_flag"] = (X_htn_pre["bmi"] < 18.5).astype(int)
+
+            X_htn = clamp_training_domains(
+                get_aligned_input(hypertension_model, X_htn_pre, FEATURES["hypertension"], model_name="hypertension", verbose=False)
+            )
+
+            # ----- HEART -----
+            X_heart_pre = X_prep.drop(columns=["heart_disease"], errors="ignore")
+            X_heart = clamp_training_domains(
+                get_aligned_input(heart_model, X_heart_pre, FEATURES["heart"], model_name="heart", verbose=False)
+            )
+
+            # Diabetes prediction
             if not show_status_and_skip("Diabetes", diabetes == 1):
-                p = diabetes_model.predict_proba(X_diab)[0][1] * 100
+                p = float(diabetes_model.predict_proba(X_diab)[0][1]) * 100
                 st.success(f"Diabetes Risk: {'Low (<1%)' if p < 1 else f'{p:.2f}%'}")
                 with st.expander("Diabetes Feature Impact"):
                     plot_shap_bar_tidy(diabetes_model, X_diab, "Diabetes", ensure=["age_group_code"])
-                    st.caption("Right = pushes risk up; Left = pushes risk down.")
+                    st.caption("Right pushes up; left pushes down.")
 
-            # Hypertension
+            # Hypertension prediction
             if not show_status_and_skip("Hypertension", hypertension_code == 1):
-                p = hypertension_model.predict_proba(X_htn)[0][1] * 100
+                p = float(hypertension_model.predict_proba(X_htn)[0][1]) * 100
                 st.success(f"Hypertension Risk: {'Low (<1%)' if p < 1 else f'{p:.2f}%'}")
                 with st.expander("Hypertension Feature Impact"):
                     plot_shap_bar_tidy(hypertension_model, X_htn, "Hypertension", ensure=["age_group_code"])
-                    st.caption("Right = pushes risk up; Left = pushes risk down.")
+                    st.caption("Right pushes up; left pushes down.")
 
-            # Heart Disease
-            if not show_status_and_skip(
-                "Heart Disease", heart_disease == 1,
-                note="(BRFSS scope: heart attack/MI or coronary heart disease/angina)"
-            ):
-                p = heart_model.predict_proba(X_heart)[0][1] * 100
+            # Heart prediction
+            if not show_status_and_skip("Heart Disease", heart_disease == 1,
+                                        note="(BRFSS scope: MI or coronary heart disease/angina)"):
+                p = float(heart_model.predict_proba(X_heart)[0][1]) * 100
                 st.success(f"Heart Disease Risk: {'Low (<1%)' if p < 1 else f'{p:.2f}%'}")
                 with st.expander("Heart Feature Impact"):
                     plot_shap_bar_tidy(heart_model, X_heart, "Heart Disease", ensure=["age_group_code"])
-                    st.caption("Right = pushes risk up; Left = pushes risk down.")
+                    st.caption("Right pushes up; left pushes down.")
 
-            # ---- Obesity (definition + propensity) ----
+            # ----- Obesity (definition + propensity) -----
             st.markdown("---")
             st.subheader("Obesity")
 
@@ -349,69 +334,34 @@ def risk_page(auto_bmi: float | None = None):
             except Exception:
                 p_prop = float(obesity_model_no_bmi.predict_proba(X_for_ob_nobmi)[0, 1])
             st.success(f"Obesity propensity (non-BMI factors): {p_prop*100:.1f}%")
-            st.caption("This reflects lifestyle/demographics/comorbidities; BMI is not used.")
+            st.caption("Reflects lifestyle/demographics/comorbidities; BMI is not used.")
 
         except Exception as e:
             st.error(f"Prediction failed: {e}")
 
-# ------------------------------------------------------------
-# About page
-# ------------------------------------------------------------
 def about_page():
     st.header("About Risk Engine v2")
-
     with card():
         st.markdown(
             """
-            **What this app estimates**
-            - Diabetes  
-            - Hypertension  
-            - Heart Disease  
+            What this app estimates
+            - Diabetes
+            - Hypertension
+            - Heart Disease
             - Obesity
 
-            **How to read the numbers**
-            - These are **probabilities** from models trained on BRFSS-like survey data.  
-            - Use for **screening and awareness**, not for diagnosis or treatment decisions.  
-            - Local SHAP bars explain **why this person’s score looks like this**.
+            How to read the numbers
+            - Probabilities from BRFSS-like survey models
+            - Screening/awareness only
+            - SHAP bars explain the positive class
             """
         )
-        muted("Version 2 • Built with Streamlit & XGBoost")
-
+        muted("Version 2 • Streamlit & XGBoost")
     with card():
-        st.subheader("Definitions (BRFSS scope)")
-        st.markdown(
-            """
-            - **Heart Disease**: Ever told by a professional you had a **heart attack (MI)** or **coronary heart disease/angina**.  
-            - **Hypertension**: Ever told you have **high blood pressure** (not pregnancy-related).  
-            - **Diabetes**: Ever told you have **diabetes** (type not separated here).  
-            - **Obesity (definition)**: BMI-based; **25.0** cutoff for Asian, **30.0** for others.  
-            - **Obesity (propensity)**: Probability from **non-BMI** factors (lifestyle, demographics, comorbidities).
-            """
-        )
-
-    with card():
-        st.subheader("Clinician-friendly justification")
+        st.subheader("Clinician-friendly note")
         st.markdown(clinician_paragraph())
 
-    with card():
-        st.subheader("Learn more")
-        st.markdown(
-            """
-            - WHO Diabetes — https://www.who.int/news-room/fact-sheets/detail/diabetes  
-            - WHO Hypertension — https://www.who.int/news-room/fact-sheets/detail/hypertension  
-            - WHO Cardiovascular diseases — https://www.who.int/news-room/fact-sheets/detail/cardiovascular-diseases-(cvds)  
-            - CDC BRFSS — https://www.cdc.gov/brfss/
-            """
-        )
-
-# ------------------------------------------------------------
-# Backward-compat shims
-# ------------------------------------------------------------
-def risk_tab(auto_bmi=None):
-    return risk_page(auto_bmi=auto_bmi)
-
-def bmi_tab():
-    return bmi_page()
-
-def about():
-    return about_page()
+# back-compat shims
+def risk_tab(auto_bmi=None): return risk_page(auto_bmi=auto_bmi)
+def bmi_tab(): return bmi_page()
+def about(): return about_page()
